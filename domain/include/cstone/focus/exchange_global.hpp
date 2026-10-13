@@ -30,7 +30,6 @@
 #include <utility>
 #include <vector>
 
-#include "cstone/domain/index_ranges.hpp"
 #include "cstone/primitives/gather.hpp"
 #include "cstone/primitives/mpi_wrappers.hpp"
 #include "cstone/tree/definitions.h"
@@ -71,15 +70,25 @@ void computeNodeOwners(OctreeView<const KeyType> gOctree,
     }
 }
 
-/*! @brief send/recv lists of the upsweep per parent level, (peer rank, child node ranges)
+/*! @brief send/recv lists of the upsweep per parent level
  *
  * send[l]: children I own, parent owned by peer
  * recv[l]: children owned by peer, parent owned by me
+ * Each message refers to the slice [offset, offset + count) of sendIdx or recvIdx, which hold the child node
+ * indices of all levels in a row.
  */
 struct UpsweepLists
 {
-    using Messages = std::vector<std::pair<int, IndexRanges<TreeNodeIndex>>>;
-    std::vector<Messages> send, recv;
+    struct Message
+    {
+        int           peer;
+        TreeNodeIndex offset;
+        TreeNodeIndex count;
+    };
+    using Messages = std::vector<Message>;
+
+    std::vector<Messages>      send, recv;
+    std::vector<TreeNodeIndex> sendIdx, recvIdx;
 };
 
 /*! @brief send/recv lists of the upsweep
@@ -99,11 +108,16 @@ UpsweepLists computeUpsweepLists(OctreeView<const KeyType> gOctree, std::span<co
     lists.send.resize(numParentLevels);
     lists.recv.resize(numParentLevels);
 
-    //! owners only increase along a level, so a peer's ranges always come in a row
-    auto addMessage = [](UpsweepLists::Messages& msgs, int peer, TreeNodeIndex first, TreeNodeIndex last)
+    //! owners only increase along a level, so a peer's children always come in a row
+    auto addMessage = [](UpsweepLists::Messages& msgs, std::vector<TreeNodeIndex>& idx, int peer, TreeNodeIndex first,
+                         TreeNodeIndex last)
     {
-        if (msgs.empty() || msgs.back().first != peer) { msgs.emplace_back(peer, IndexRanges<TreeNodeIndex>{}); }
-        msgs.back().second.addRange(first, last);
+        if (msgs.empty() || msgs.back().peer != peer) { msgs.push_back({peer, TreeNodeIndex(idx.size()), 0}); }
+        for (TreeNodeIndex i = first; i < last; ++i)
+        {
+            idx.push_back(i);
+        }
+        msgs.back().count += last - first;
     };
 
     for (int l = 0; l < numParentLevels; ++l)
@@ -127,8 +141,14 @@ UpsweepLists computeUpsweepLists(OctreeView<const KeyType> gOctree, std::span<co
                     ++runEnd;
                 }
 
-                if (owner == myRank && nodeOwner[p] != myRank) { addMessage(lists.send[l], nodeOwner[p], c, runEnd); }
-                if (owner != myRank && nodeOwner[p] == myRank) { addMessage(lists.recv[l], owner, c, runEnd); }
+                if (owner == myRank && nodeOwner[p] != myRank)
+                {
+                    addMessage(lists.send[l], lists.sendIdx, nodeOwner[p], c, runEnd);
+                }
+                if (owner != myRank && nodeOwner[p] == myRank)
+                {
+                    addMessage(lists.recv[l], lists.recvIdx, owner, c, runEnd);
+                }
 
                 c = runEnd;
             }
@@ -142,7 +162,7 @@ UpsweepLists computeUpsweepLists(OctreeView<const KeyType> gOctree, std::span<co
  *
  * @param[in]  gOctree          global octree, same on all ranks
  * @param[in]  globDispl        first global leaf per rank, length numRanks + 1
- * @param[in]  nodeOwner        owner rank per node
+ * @param[in]  lists            send/recv lists per parent level
  * @param[in]  gLeafQLoc        quantities of my global leaves
  * @param[out] globQ            quantities of the global tree, valid for nodes I own and their children
  * @param[in]  myRank           executing rank
@@ -153,7 +173,7 @@ UpsweepLists computeUpsweepLists(OctreeView<const KeyType> gOctree, std::span<co
 template<class Q, class KeyType, class F, class... UArgs>
 void globalUpsweep(OctreeView<const KeyType> gOctree,
                    std::span<const TreeNodeIndex> globDispl,
-                   std::span<const int> nodeOwner,
+                   const UpsweepLists& lists,
                    std::span<const Q> gLeafQLoc,
                    std::span<Q> globQ,
                    int myRank,
@@ -163,9 +183,8 @@ void globalUpsweep(OctreeView<const KeyType> gOctree,
 {
     auto levelRange     = gOctree.levelRangeSpan();
     auto leafToInternal = gOctree.leafToInternalSpan();
-
-    UpsweepLists lists  = computeUpsweepLists(gOctree, std::span<const int>(nodeOwner), myRank);
     int numParentLevels = int(lists.send.size());
+    std::span<const TreeNodeIndex> sendIdx(lists.sendIdx), recvIdx(lists.recvIdx);
 
     //! scatter local leaf quantities
     scatter(leafToInternal.subspan(globDispl[myRank], gLeafQLoc.size()), gLeafQLoc.data(), globQ.data());
@@ -181,24 +200,15 @@ void globalUpsweep(OctreeView<const KeyType> gOctree,
         //! exchange child quantities with their owners
         for (std::size_t m = 0; m < recv.size(); ++m)
         {
-            const auto& [peer, ranges] = recv[m];
-            recvBuf[m].resize(ranges.totalCount());
-            mpiRecvAsync(recvBuf[m].data(), int(ranges.totalCount()), peer, tag, requests, comm);
+            recvBuf[m].resize(recv[m].count);
+            mpiRecvAsync(recvBuf[m].data(), recv[m].count, recv[m].peer, tag, requests, comm);
         }
 
         for (std::size_t m = 0; m < send.size(); ++m)
         {
-            const auto& [peer, ranges] = send[m];
-            sendBuf[m].resize(ranges.totalCount());
-            std::size_t writeIdx = 0;
-            for (std::size_t k = 0; k < ranges.nRanges(); ++k)
-            {
-                for (TreeNodeIndex i = ranges.rangeStart(k); i < ranges.rangeEnd(k); ++i)
-                {
-                    sendBuf[m][writeIdx++] = globQ[i];
-                }
-            }
-            mpiSendAsync(sendBuf[m].data(), int(ranges.totalCount()), peer, tag, requests, comm);
+            sendBuf[m].resize(send[m].count);
+            gather(sendIdx.subspan(send[m].offset, send[m].count), globQ.data(), sendBuf[m].data());
+            mpiSendAsync(sendBuf[m].data(), send[m].count, send[m].peer, tag, requests, comm);
         }
 
         MPI_Waitall(int(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
@@ -206,15 +216,7 @@ void globalUpsweep(OctreeView<const KeyType> gOctree,
         //! place received child quantities
         for (std::size_t m = 0; m < recv.size(); ++m)
         {
-            const auto& ranges  = recv[m].second;
-            std::size_t readIdx = 0;
-            for (std::size_t k = 0; k < ranges.nRanges(); ++k)
-            {
-                for (TreeNodeIndex i = ranges.rangeStart(k); i < ranges.rangeEnd(k); ++i)
-                {
-                    globQ[i] = recvBuf[m][readIdx++];
-                }
-            }
+            scatter(recvIdx.subspan(recv[m].offset, recv[m].count), recvBuf[m].data(), globQ.data());
         }
 
         // TODO GPU does not work with subspans

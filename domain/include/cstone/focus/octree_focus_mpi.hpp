@@ -625,10 +625,27 @@ public:
         populateGlobal<Q>(gOctree.leafSpan(), quantities, gLeafQLoc, gmap);
 
         auto globQuse = globQOut.data() ? globQOut : globQ;
+
+        //! host copy of the global tree topology for the owner and p2p list bookkeeping
+        OctreeView<const KeyType> hostTree = gOctree;
+        std::vector<TreeNodeIndex> childOffsetsHost, leafToInternalHost;
+        if constexpr (execution::HaveGpu<Exec>{})
+        {
+            childOffsetsHost.resize(gOctree.numNodes);
+            leafToInternalHost.resize(gOctree.numNodes);
+            memcpyD2HAsync(exec_, gOctree.childOffsets, gOctree.numNodes, childOffsetsHost.data());
+            memcpyD2HAsync(exec_, gOctree.leafToInternal, gOctree.numNodes, leafToInternalHost.data());
+            syncGpu(exec_);
+
+            hostTree.childOffsets = childOffsetsHost.data();
+            hostTree.leafToInternal = leafToInternalHost.data();
+        }
+
         //! level-by-level upsweep of the distributed global tree, point-to-point between node owners
         std::vector<int> nodeOwner(gOctree.numNodes);
-        computeNodeOwners(gOctree, globDispl_, nodeOwner);
-        globalUpsweep<Q>(gOctree, globDispl_, nodeOwner, std::span<const Q>(gLeafQLoc), globQuse, myRank_, comm_,
+        computeNodeOwners(hostTree, globDispl_, nodeOwner);
+        UpsweepLists lists = computeUpsweepLists(hostTree, std::span<const int>(nodeOwner), myRank_);
+        globalUpsweep<Q>(gOctree, globDispl_, lists, std::span<const Q>(gLeafQLoc), globQuse, myRank_, comm_,
                          upsweepFunction, upsweepArgs...);
 
         //! from the global tree, extract the part that the executing rank was missing
