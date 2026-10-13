@@ -357,7 +357,7 @@ public:
         {
             if constexpr (execution::HaveGpu<Exec>{})
             {
-                upsweepCentersGpu(exec_, maxTreeLevel<KeyType>{}, levelRange.data(), childOffsets, centers);
+                upsweepCentersGpu(exec_, int(levelRange.size()) - 1, levelRange.data(), childOffsets, centers);
             }
             else { upsweep(levelRange, childOffsets, centers, CombineSourceCenter<RealType>{}); }
         };

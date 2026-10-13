@@ -69,7 +69,7 @@ public:
 
         auto upsweepGpu = [](auto levelRange, auto childOffsets, auto M, auto centers)
         {
-            int numLevels = levelRange.size() - 2;
+            int numLevels = levelRange.size() - 1;
             for (int level = numLevels - 1; level >= 0; level--)
             {
                 int numCellsLevel = levelRange[level + 1] - levelRange[level];
