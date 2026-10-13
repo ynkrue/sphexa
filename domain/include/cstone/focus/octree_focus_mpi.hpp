@@ -23,6 +23,7 @@
 #include "cstone/cuda/device_vector.h"
 #include "cstone/domain/layout.hpp"
 #include "cstone/focus/exchange_focus.hpp"
+#include "cstone/focus/exchange_global.hpp"
 #include "cstone/focus/octree_focus.hpp"
 #include "cstone/focus/peer_flags.hpp"
 #include "cstone/focus/source_center.hpp"
@@ -300,6 +301,7 @@ public:
     template<class T>
     void extractGlobal(const KeyType* globalNodeKeys,
                        const TreeNodeIndex* globalLevelRange,
+                       std::span<const int> nodeOwner,
                        std::span<const T> globalQuantities,
                        std::span<T> localQuantities,
                        TreeNodeIndex* letIdxBuf,
@@ -312,13 +314,14 @@ public:
         std::span letToGlob{letToGlobBuf, idxFromGlob.size()};
         if constexpr (execution::HaveGpu<Exec>{})
         {
-            memcpyH2DAsync(exec_, idxFromGlob.data(), idxFromGlob.size(), letIdx.data());
-            gather(exec_, letIdx.data(), idxFromGlob.size(), toInternal, letIdx.data());
+            // TODO GPU: globalQuantities only valid on owners
+            // memcpyH2DAsync(exec_, idxFromGlob.data(), idxFromGlob.size(), letIdx.data());
+            // gather(exec_, letIdx.data(), idxFromGlob.size(), toInternal, letIdx.data());
 
-            locateNodesGpu(exec_, octreeAcc_.prefixes.data(), letIdx.data(), idxFromGlob.size(), globalNodeKeys,
-                           globalLevelRange, letToGlob.data());
-            gatherScatter(exec_, letToGlob.data(), letIdx.data(), idxFromGlob.size(), globalQuantities.data(),
-                          localQuantities.data());
+            // locateNodesGpu(exec_, octreeAcc_.prefixes.data(), letIdx.data(), idxFromGlob.size(), globalNodeKeys,
+            //                globalLevelRange, letToGlob.data());
+            // gatherScatter(exec_, letToGlob.data(), letIdx.data(), idxFromGlob.size(), globalQuantities.data(),
+            //               localQuantities.data());
         }
         else
         {
@@ -328,16 +331,10 @@ public:
             {
                 letToGlob[i] = locateNode(octreeAcc_.prefixes[idxFromGlob[i]], globalNodeKeys, globalLevelRange);
             }
-            gatherScatter<TreeNodeIndex>(letToGlob, idxFromGlob, globalQuantities.data(), localQuantities.data());
+            std::vector<T> globValues(idxFromGlob.size());
+            gatherFromOwners<T>(letToGlob, nodeOwner, globalQuantities.data(), globValues.data(), comm_);
+            scatter<TreeNodeIndex>(idxFromGlob, globValues.data(), localQuantities.data());
         }
-    }
-
-    //! @brief Distribute global leaf quantities with local part filled in
-    template<class T>
-    void gatherGlobalLeaves(std::span<T> gLeafQLoc, std::span<T> gLeafQAll) const
-    {
-        mpiAllgathervGpuDirect(exec_, gLeafQLoc.data(), globNumNodes_[myRank_], gLeafQAll.data(), globNumNodes_.data(),
-                               globDispl_.data(), comm_);
     }
 
     template<class Tm, class DevVec1 = std::vector<LocalIndex>, class DevVec2 = std::vector<LocalIndex>>
@@ -618,26 +615,25 @@ public:
                         UArgs&&... upsweepArgs) const
     {
         assert(gOctree.leaves != nullptr);
-        std::size_t numGlobalLeaves = gOctree.numLeafNodes;
-        std::size_t numLetIdx       = octreeAcc_.numLeafNodes;
-        auto s                      = scratch.size();
-        auto [gLeafQAll, gLeafQLoc, globQ, gmap, letIdx, letToGlob] =
-            util::packAllocBuffer(scratch, util::TypeList<Q, Q, Q, TreeNodeIndex, TreeNodeIndex, TreeNodeIndex>{},
-                                  {numGlobalLeaves, size_t(globNumNodes_[myRank_]), size_t(gOctree.numNodes),
+        std::size_t numLetIdx = octreeAcc_.numLeafNodes;
+        auto s                = scratch.size();
+        auto [gLeafQLoc, globQ, gmap, letIdx, letToGlob] =
+            util::packAllocBuffer(scratch, util::TypeList<Q, Q, TreeNodeIndex, TreeNodeIndex, TreeNodeIndex>{},
+                                  {size_t(globNumNodes_[myRank_]), size_t(gOctree.numNodes),
                                    size_t(globNumNodes_[myRank_]), numLetIdx, numLetIdx},
                                   128);
         populateGlobal<Q>(gOctree.leafSpan(), quantities, gLeafQLoc, gmap);
 
-        //! exchange global leaves
-        gatherGlobalLeaves<Q>(gLeafQLoc, gLeafQAll);
-
         auto globQuse = globQOut.data() ? globQOut : globQ;
-        scatter(exec_, gOctree.leafToInternalSpan(), gLeafQAll.data(), globQuse.data());
-        //! upsweep with the global tree
-        upsweepFunction(gOctree.levelRangeSpan(), gOctree.childOffsets, globQuse.data(), upsweepArgs...);
+        //! level-by-level upsweep of the distributed global tree, point-to-point between node owners
+        std::vector<int> nodeOwner(gOctree.numNodes);
+        computeNodeOwners(gOctree, globDispl_, nodeOwner);
+        globalUpsweep<Q>(gOctree, globDispl_, nodeOwner, std::span<const Q>(gLeafQLoc), globQuse, myRank_, comm_,
+                         upsweepFunction, upsweepArgs...);
 
         //! from the global tree, extract the part that the executing rank was missing
-        extractGlobal<Q>(gOctree.prefixes, gOctree.d_levelRange, globQuse, quantities, letIdx.data(), letToGlob.data());
+        extractGlobal<Q>(gOctree.prefixes, gOctree.d_levelRange, nodeOwner, globQuse, quantities, letIdx.data(),
+                         letToGlob.data());
         reallocate(scratch, s, 1.0);
     }
 
