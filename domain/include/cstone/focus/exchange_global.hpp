@@ -30,6 +30,8 @@
 #include <utility>
 #include <vector>
 
+#include "cstone/primitives/primitives_acc.hpp"
+#include "cstone/primitives/primitives_gpu.h"
 #include "cstone/primitives/gather.hpp"
 #include "cstone/primitives/mpi_wrappers.hpp"
 #include "cstone/tree/definitions.h"
@@ -163,6 +165,8 @@ UpsweepLists computeUpsweepLists(OctreeView<const KeyType> gOctree, std::span<co
  * @param[in]  gOctree          global octree, same on all ranks
  * @param[in]  globDispl        first global leaf per rank, length numRanks + 1
  * @param[in]  lists            send/recv lists per parent level
+ * @param[in]  sendIdx          child indices of all send messages, on the device if exec is Gpu
+ * @param[in]  recvIdx          child indices of all recv messages, on the device if exec is Gpu
  * @param[in]  gLeafQLoc        quantities of my global leaves
  * @param[out] globQ            quantities of the global tree, valid for nodes I own and their children
  * @param[in]  myRank           executing rank
@@ -170,10 +174,13 @@ UpsweepLists computeUpsweepLists(OctreeView<const KeyType> gOctree, std::span<co
  * @param[in]  upsweepFunction  upsweep of one level
  * @param[in]  upsweepArgs      extra upsweep arguments, e.g. expansion centers
  */
-template<class Q, class KeyType, class F, class... UArgs>
-void globalUpsweep(OctreeView<const KeyType> gOctree,
+template<class Q, class Exec, class KeyType, class F, class... UArgs>
+void globalUpsweep(Exec exec,
+                   OctreeView<const KeyType> gOctree,
                    std::span<const TreeNodeIndex> globDispl,
                    const UpsweepLists& lists,
+                   std::span<const TreeNodeIndex> sendIdx,
+                   std::span<const TreeNodeIndex> recvIdx,
                    std::span<const Q> gLeafQLoc,
                    std::span<Q> globQ,
                    int myRank,
@@ -181,19 +188,19 @@ void globalUpsweep(OctreeView<const KeyType> gOctree,
                    F&& upsweepFunction,
                    UArgs&&... upsweepArgs)
 {
+    using BufType = std::conditional_t<execution::HaveGpu<Exec>{}, DeviceVector<Q>, std::vector<Q>>;
     auto levelRange     = gOctree.levelRangeSpan();
     auto leafToInternal = gOctree.leafToInternalSpan();
     int numParentLevels = int(lists.send.size());
-    std::span<const TreeNodeIndex> sendIdx(lists.sendIdx), recvIdx(lists.recvIdx);
 
     //! scatter local leaf quantities
-    scatter(leafToInternal.subspan(globDispl[myRank], gLeafQLoc.size()), gLeafQLoc.data(), globQ.data());
+    scatter(exec, leafToInternal.subspan(globDispl[myRank], gLeafQLoc.size()), gLeafQLoc.data(), globQ.data());
 
     for (int l = numParentLevels - 1; l >= 0; --l)
     {
         const auto& send = lists.send[l];
         const auto& recv = lists.recv[l];
-        std::vector<std::vector<Q>> sendBuf(send.size()), recvBuf(recv.size());
+        std::vector<BufType> sendBuf(send.size()), recvBuf(recv.size());
         std::vector<MPI_Request> requests;
         int tag = static_cast<int>(P2pTags::focusGlobalUpsweep) + l;
 
@@ -204,10 +211,17 @@ void globalUpsweep(OctreeView<const KeyType> gOctree,
             mpiRecvAsync(recvBuf[m].data(), recv[m].count, recv[m].peer, tag, requests, comm);
         }
 
+        //! pack all messages before sending loop (asynchronous GPU kernel launches)
         for (std::size_t m = 0; m < send.size(); ++m)
         {
             sendBuf[m].resize(send[m].count);
-            gather(sendIdx.subspan(send[m].offset, send[m].count), globQ.data(), sendBuf[m].data());
+            gather(exec, sendIdx.subspan(send[m].offset, send[m].count), globQ.data(), sendBuf[m].data());
+        }
+
+        if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
+
+        for (std::size_t m = 0; m < send.size(); ++m)
+        {
             mpiSendAsync(sendBuf[m].data(), send[m].count, send[m].peer, tag, requests, comm);
         }
 
@@ -216,10 +230,9 @@ void globalUpsweep(OctreeView<const KeyType> gOctree,
         //! place received child quantities
         for (std::size_t m = 0; m < recv.size(); ++m)
         {
-            scatter(recvIdx.subspan(recv[m].offset, recv[m].count), recvBuf[m].data(), globQ.data());
+            scatter(exec, recvIdx.subspan(recv[m].offset, recv[m].count), recvBuf[m].data(), globQ.data());
         }
 
-        // TODO GPU does not work with subspans
         //! accumulate this parent level
         upsweepFunction(levelRange.subspan(l, 2), gOctree.childOffsets, globQ.data(), upsweepArgs...);
     }
@@ -227,14 +240,15 @@ void globalUpsweep(OctreeView<const KeyType> gOctree,
 
 /*! @brief gather with distributed src, src[gmap[k]] fetched from its owner rank
  *
- * @param[in]  gmap       global node per entry
- * @param[in]  nodeOwner  owner rank per global node
+ * @param[in]  exec       execution policy, src and out are on the device if Gpu
+ * @param[in]  gmap       global node per entry, on the host
+ * @param[in]  nodeOwner  owner rank per global node, on the host
  * @param[in]  src        quantities of the global tree, valid on the owner
  * @param[out] out        out[k] = src[gmap[k]], length gmap.size()
  * @param[in]  comm       MPI communicator
  */
-template<class T>
-void gatherFromOwners(
+template<class T, class Exec>
+void gatherFromOwners(Exec exec,
     std::span<const TreeNodeIndex> gmap, std::span<const int> nodeOwner, const T* src, T* out, MPI_Comm comm)
 {
     int numRanks = 0;
@@ -248,7 +262,7 @@ void gatherFromOwners(
     std::vector<int> sendCounts(numRanks, 0), sendDispl(numRanks + 1, 0);
     std::vector<TreeNodeIndex> sendIdx(n);
 
-    std::vector<int> order(n);
+    std::vector<TreeNodeIndex> order(n);
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](int a, int b)
               { return std::pair(nodeOwner[gmap[a]], gmap[a]) < std::pair(nodeOwner[gmap[b]], gmap[b]); });
@@ -289,12 +303,15 @@ void gatherFromOwners(
 
     MPI_Waitall(int(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
 
-    //! round 2: values of the requested nodes
-    std::vector<T> sendQ(recvIdx.size()), recvQ(n);
-    for (std::size_t i = 0; i < recvIdx.size(); ++i)
-    {
-        sendQ[i] = src[recvIdx[i]];
-    }
+    //! round 2: values of the requested nodes, on the device if exec is Gpu
+    using IdxVec = std::conditional_t<execution::HaveGpu<Exec>{}, DeviceVector<TreeNodeIndex>, std::vector<TreeNodeIndex>>;
+    using BufType = std::conditional_t<execution::HaveGpu<Exec>{}, DeviceVector<T>, std::vector<T>>;
+    IdxVec recvIdxAcc(recvIdx), orderAcc(order);
+    BufType sendQ(recvIdx.size()), recvQ(n);
+
+    //! pack requested values, must be finished before MPI reads sendQ
+    gather(exec, std::span<const TreeNodeIndex>(recvIdxAcc.data(), recvIdxAcc.size()), src, sendQ.data());
+    if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
 
     requests.clear();
     for (int r = 0; r < numRanks; ++r)
@@ -316,10 +333,7 @@ void gatherFromOwners(
     MPI_Waitall(int(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
 
     //! recvQ is in sendIdx order, order[m] is the original position
-    for (std::size_t m = 0; m < n; ++m)
-    {
-        out[order[m]] = recvQ[m];
-    }
+    scatter(exec, std::span<const TreeNodeIndex>(orderAcc.data(), orderAcc.size()), recvQ.data(), out);
 }
 
 } // namespace cstone

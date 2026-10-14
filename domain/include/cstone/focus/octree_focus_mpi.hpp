@@ -314,14 +314,20 @@ public:
         std::span letToGlob{letToGlobBuf, idxFromGlob.size()};
         if constexpr (execution::HaveGpu<Exec>{})
         {
-            // TODO GPU: globalQuantities only valid on owners
-            // memcpyH2DAsync(exec_, idxFromGlob.data(), idxFromGlob.size(), letIdx.data());
-            // gather(exec_, letIdx.data(), idxFromGlob.size(), toInternal, letIdx.data());
+            memcpyH2DAsync(exec_, idxFromGlob.data(), idxFromGlob.size(), letIdx.data());
+            gather(exec_, letIdx.data(), idxFromGlob.size(), toInternal, letIdx.data());
 
-            // locateNodesGpu(exec_, octreeAcc_.prefixes.data(), letIdx.data(), idxFromGlob.size(), globalNodeKeys,
-            //                globalLevelRange, letToGlob.data());
-            // gatherScatter(exec_, letToGlob.data(), letIdx.data(), idxFromGlob.size(), globalQuantities.data(),
-            //               localQuantities.data());
+            locateNodesGpu(exec_, octreeAcc_.prefixes.data(), letIdx.data(), idxFromGlob.size(), globalNodeKeys,
+                           globalLevelRange, letToGlob.data());
+
+            // global node indices on host for MPI communication
+            std::vector<TreeNodeIndex> letToGlobHost(idxFromGlob.size());
+            memcpyD2HAsync(exec_, letToGlob.data(), letToGlob.size(), letToGlobHost.data());
+            syncGpu(exec_);
+
+            DeviceVector<T> globValues(idxFromGlob.size());
+            gatherFromOwners<T>(exec_, letToGlobHost, nodeOwner, globalQuantities.data(), globValues.data(), comm_);
+            scatter(exec_, letIdx.data(), idxFromGlob.size(), globValues.data(), localQuantities.data());
         }
         else
         {
@@ -332,7 +338,7 @@ public:
                 letToGlob[i] = locateNode(octreeAcc_.prefixes[idxFromGlob[i]], globalNodeKeys, globalLevelRange);
             }
             std::vector<T> globValues(idxFromGlob.size());
-            gatherFromOwners<T>(letToGlob, nodeOwner, globalQuantities.data(), globValues.data(), comm_);
+            gatherFromOwners<T>(exec_, letToGlob, nodeOwner, globalQuantities.data(), globValues.data(), comm_);
             scatter<TreeNodeIndex>(idxFromGlob, globValues.data(), localQuantities.data());
         }
     }
@@ -645,8 +651,15 @@ public:
         std::vector<int> nodeOwner(gOctree.numNodes);
         computeNodeOwners(hostTree, globDispl_, nodeOwner);
         UpsweepLists lists = computeUpsweepLists(hostTree, std::span<const int>(nodeOwner), myRank_);
-        globalUpsweep<Q>(gOctree, globDispl_, lists, std::span<const Q>(gLeafQLoc), globQuse, myRank_, comm_,
-                         upsweepFunction, upsweepArgs...);
+
+        //! child indices of the upsweep messages on the accelerator
+        AccVector<TreeNodeIndex> sendIdxAcc, recvIdxAcc;
+        sendIdxAcc = lists.sendIdx;
+        recvIdxAcc = lists.recvIdx;
+
+        globalUpsweep<Q>(exec_, gOctree, globDispl_, lists, {rawPtr(sendIdxAcc), sendIdxAcc.size()},
+                         {rawPtr(recvIdxAcc), recvIdxAcc.size()}, std::span<const Q>(gLeafQLoc), globQuse, myRank_,
+                         comm_, upsweepFunction, upsweepArgs...);
 
         //! from the global tree, extract the part that the executing rank was missing
         extractGlobal<Q>(gOctree.prefixes, gOctree.d_levelRange, nodeOwner, globQuse, quantities, letIdx.data(),
